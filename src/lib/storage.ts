@@ -19,11 +19,12 @@ const getRaw = <T,>(k: string, fallback: T): T => {
 const set = (k: string, v: unknown) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* ignore */ } };
 
 export const DEFAULT_PROFILE: Profile = {
-  name: "Traveler", xp: 0, games: 0, correct: 0, wrong: 0,
+  name: "Traveler", avatar: "🧑‍🍳", xp: 0, coins: 120, games: 0, correct: 0, wrong: 0,
   bestScore: 0, bestStreak: 0, bestCombo: 0, bestAccuracy: 0,
   impossibleCorrect: 0, dailyCompleted: 0, perfectRounds: 0,
   countryWins: {}, foodWins: {}, unlocked: [], dailyDone: {},
   totalsByContinent: {}, timeAttackBest: 0,
+  discovered: [], freeHintsDate: "", freeHintsLeft: 3, hintsUsed: 0, mysteryBest: 0,
 };
 
 export const DEFAULT_SETTINGS: Settings = {

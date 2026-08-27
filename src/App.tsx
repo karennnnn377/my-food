@@ -65,6 +65,40 @@ function Shell({ settings, setSettings }: { settings: Settings; setSettings: (s:
   const updateSettings = (s: Settings) => setSettings(s);
   const saveProf = (p: Profile) => { setProfile(p); saveProfile(p); };
 
+  // ---- coins + free hints ----
+  const spendCoins = useCallback((n: number): boolean => {
+    let ok = false;
+    setProfile((p) => {
+      if (p.coins < n) return p;
+      ok = true;
+      const np = { ...p, coins: p.coins - n };
+      saveProfile(np);
+      return np;
+    });
+    return ok;
+  }, []);
+  const useFreeHint = useCallback((): boolean => {
+    let ok = false;
+    setProfile((p) => {
+      if (p.freeHintsLeft <= 0) return p;
+      ok = true;
+      const np = { ...p, freeHintsLeft: p.freeHintsLeft - 1 };
+      saveProfile(np);
+      return np;
+    });
+    return ok;
+  }, []);
+  // reset the 3 daily free hints each new day
+  useEffect(() => {
+    const k = todayKey();
+    setProfile((p) => {
+      if (p.freeHintsDate === k) return p;
+      const np = { ...p, freeHintsDate: k, freeHintsLeft: 3 };
+      saveProfile(np);
+      return np;
+    });
+  }, []);
+
   const startGame = useCallback((c: GameConfig) => {
     setCfg(c); setResult(null);
     setGameId((g) => g + 1);
@@ -72,7 +106,7 @@ function Shell({ settings, setSettings }: { settings: Settings; setSettings: (s:
   }, []);
 
   const onGameDone = useCallback((r: GameResult) => {
-    const { profile: np, newUnlocked, levelBefore } = applyResult(profile, r);
+    const { profile: np, newUnlocked, levelBefore, coinsEarned, newlyDiscovered } = applyResult(profile, r, r.hintsUsed ?? 0);
     if (r.mode === "daily") {
       np.dailyCompleted += 1;
       np.dailyDone[todayKey()] = { score: r.score, correct: r.correct, total: r.total };
@@ -81,6 +115,7 @@ function Shell({ settings, setSettings }: { settings: Settings; setSettings: (s:
     recordResult(r, todayKey());
     const newLevel = levelFromXp(np.xp).level;
     if (newLevel > levelBefore) { sfx.play("level"); toast(`${t("levelUpMsg")} ${t("level")} ${newLevel} ⭐`); }
+    if (newlyDiscovered.length > 0) toast(`${t("newDiscovery")} (+${newlyDiscovered.length})`);
     if (newUnlocked.length) {
       sfx.play("achieve");
       setUnlockedMeta(newUnlocked.map((id) => {
@@ -88,7 +123,7 @@ function Shell({ settings, setSettings }: { settings: Settings; setSettings: (s:
         return { icon: a?.icon ?? "🏆", name: a ? L(a.name) : id };
       }));
     } else setUnlockedMeta([]);
-    setResult(r);
+    setResult({ ...r, discoveries: newlyDiscovered.length, coinsEarned });
     setRoute({ page: "results" }); window.scrollTo({ top: 0 });
   }, [profile, toast, t, L]);
 
@@ -100,7 +135,8 @@ function Shell({ settings, setSettings }: { settings: Settings; setSettings: (s:
       case "setup": return <SetupPage mode={route.param ?? "classic"} nav={nav} onStart={startGame} profile={profile} />;
       case "game":
         if (!cfg) { setTimeout(() => nav({ page: "home" }), 0); return null; }
-        return <GameView key={gameId} cfg={cfg} onDone={onGameDone} onQuit={() => nav({ page: "home" })} />;
+        return <GameView key={gameId} cfg={cfg} onDone={onGameDone} onQuit={() => nav({ page: "home" })}
+          coins={profile.coins} onSpendCoins={spendCoins} onUseFreeHint={useFreeHint} freeHints={profile.freeHintsLeft} />;
       case "results":
         if (!result) { setTimeout(() => nav({ page: "home" }), 0); return null; }
         return <ResultScreen result={result} unlocked={unlockedMeta} levelNow={levelFromXp(profile.xp).level}
@@ -120,7 +156,7 @@ function Shell({ settings, setSettings }: { settings: Settings; setSettings: (s:
   const links: { page: string; label: string; icon: string }[] = [
     { page: "setup:classic", label: t("play"), icon: "play" },
     { page: "daily", label: t("dailyNav"), icon: "calendar" },
-    { page: "library", label: t("library"), icon: "book" },
+    { page: "library", label: t("collection"), icon: "book" },
     { page: "countries", label: t("countries"), icon: "globe" },
     { page: "leaderboard", label: t("leaderboard"), icon: "trophy" },
     { page: "profile", label: t("profile"), icon: "users" },
@@ -134,10 +170,15 @@ function Shell({ settings, setSettings }: { settings: Settings; setSettings: (s:
       {/* top nav */}
       <header className="sticky top-0 z-50 border-b border-line bg-bg/85 backdrop-blur-md">
         <div className="max-w-6xl mx-auto px-4 h-16 flex items-center gap-3">
-          <button onClick={() => nav({ page: "home" })} className="btn-press flex items-center gap-2.5 shrink-0" aria-label="FoodGuess home">
-            <span className="w-10 h-10 rounded-xl bg-saffron flex items-center justify-center text-xl shadow-[0_6px_18px_-6px_rgba(255,138,0,0.7)]" aria-hidden="true">🍲</span>
-            <span className="font-display font-extrabold text-xl tracking-tight hidden sm:block">Food<span className="text-saffron">Guess</span></span>
+          <button onClick={() => nav({ page: "home" })} className="btn-press flex items-center gap-2.5 shrink-0" aria-label={t("brand")}>
+            <span className="w-10 h-10 rounded-xl bg-saffron flex items-center justify-center text-xl shadow-[0_6px_18px_-6px_rgba(255,138,0,0.7)]" aria-hidden="true">🍽️</span>
+            <span className="font-display font-extrabold text-lg sm:text-xl tracking-tight hidden sm:block whitespace-nowrap">
+              <span className="text-saffron">{t("brand").split(" ")[0]}</span> {t("brand").split(" ").slice(1).join(" ")}
+            </span>
           </button>
+          <span className="hidden lg:flex items-center gap-1 text-saffron/80 font-bold text-sm shrink-0" title={t("coinsLbl")}>
+            💰 {profile.coins.toLocaleString()}
+          </span>
 
           <nav className="flex items-center gap-1 overflow-x-auto flex-1 scrollbar-none px-1" aria-label="Main">
             {links.map((l) => {
@@ -241,13 +282,19 @@ function Shell({ settings, setSettings }: { settings: Settings; setSettings: (s:
   );
 }
 
-function GameView({ cfg, onDone, onQuit }: { cfg: GameConfig; onDone: (r: GameResult) => void; onQuit: () => void }) {
+interface GameViewProps {
+  cfg: GameConfig; onDone: (r: GameResult) => void; onQuit: () => void;
+  coins: number; onSpendCoins: (n: number) => boolean; onUseFreeHint: () => boolean; freeHints: number;
+}
+function GameView({ cfg, onDone, onQuit, coins, onSpendCoins, onUseFreeHint, freeHints }: GameViewProps) {
   const initial = useMemo(() => {
     if (cfg.mode === "daily") return dailySession(todayKey());
     if (cfg.mode === "timeattack" || cfg.mode === "endless") return undefined;
-    return buildSession({ diff: cfg.diff, country: cfg.country, count: cfg.questions });
+    if (cfg.mode === "mystery") return buildSession({ diff: cfg.diff, country: cfg.country, onlyType: "foodname", count: cfg.questions });
+    return buildSession({ diff: cfg.diff, country: cfg.country, city: cfg.city, count: cfg.questions });
   }, [cfg]);
-  return <GameScreen cfg={cfg} initial={initial} onDone={onDone} onQuit={onQuit} />;
+  return <GameScreen cfg={cfg} initial={initial} onDone={onDone} onQuit={onQuit}
+    coins={coins} onSpendCoins={onSpendCoins} onUseFreeHint={onUseFreeHint} freeHints={freeHints} />;
 }
 
 /* ================= DAILY CHALLENGE ================= */

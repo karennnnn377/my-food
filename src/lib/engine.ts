@@ -1,5 +1,5 @@
 import type { Difficulty, Food, GameResult, Profile, QType, Question, ScoringConfig, L10n } from "../data/types";
-import { DB, getFood, getCountry } from "./data";
+import { DB, getFood, getCountry, cityOf } from "./data";
 import { TRIVIA } from "../data/impossible";
 
 // ---------------- RNG ----------------
@@ -64,7 +64,7 @@ export function levelFromXp(xp: number): { level: number; into: number; need: nu
 }
 
 // ---------------- question generation ----------------
-const ALL_TYPES: QType[] = ["country", "cuisine", "foodname", "ingredient", "meat", "region", "notingredient"];
+const ALL_TYPES: QType[] = ["country", "cuisine", "foodname", "ingredient", "meat", "region", "notingredient", "ingfood", "city", "recipe"];
 
 function eligibleTypes(f: Food): QType[] {
   const db = DB();
@@ -73,7 +73,17 @@ function eligibleTypes(f: Food): QType[] {
     switch (t) {
       case "country": case "cuisine": case "foodname": types.push(t); break;
       case "ingredient": case "notingredient": if (f.ings.length >= 3) types.push(t); break;
+      case "ingfood": case "recipe": if (f.ings.length >= 3) types.push(t); break;
       case "meat": if (f.meats[0] !== "none") types.push(t); break;
+      case "city": {
+        const c = cityOf(f);
+        if (c) {
+          const sameCountry = db.byCountry.get(f.country) ?? [];
+          const others = new Set(sameCountry.map((x) => cityOf(x)).filter((x) => x && x !== c));
+          if (others.size >= 3) types.push(t);
+        }
+        break;
+      }
       case "region": {
         if (f.region && f.region !== "Nationwide") {
           const regions = new Set(db.foods.map((x) => x.region).filter((r) => r && r !== "Nationwide" && r !== f.region));
@@ -84,6 +94,16 @@ function eligibleTypes(f: Food): QType[] {
     }
   }
   return types;
+}
+
+/** Three plausible food-name distractors: same country first, then the wider world. */
+function foodNameDistractors(food: Food, rng: () => number): string[] | null {
+  const db = DB();
+  const same = db.foods.filter((f) => f.country === food.country && f.id !== food.id).map((f) => f.id);
+  const other = db.foods.filter((f) => f.country !== food.country && f.id !== food.id).map((f) => f.id);
+  let d = shuffle(same, rng).slice(0, 3);
+  if (d.length < 3) d = [...d, ...shuffle(other, rng).slice(0, 3 - d.length)];
+  return d.length >= 3 ? d : null;
 }
 
 function distractorsFrom<T>(pool: T[], exclude: Set<string>, key: (x: T) => string, n: number, rng: () => number): string[] {
@@ -134,12 +154,30 @@ export function makeQuestion(food: Food, type: QType, rng: () => number): Questi
       return { ...base, id: `${food.id}:meat`, correct, options: shuffle([correct, ...d], rng) };
     }
     case "foodname": {
-      const same = db.foods.filter((f) => f.country === food.country && f.id !== food.id).map((f) => f.id);
-      const other = db.foods.filter((f) => f.country !== food.country && f.id !== food.id).map((f) => f.id);
-      let d = shuffle(same, rng).slice(0, 3);
-      if (d.length < 3) d = [...d, ...shuffle(other, rng).slice(0, 3 - d.length)];
-      if (d.length < 3) return null;
+      const d = foodNameDistractors(food, rng);
+      if (!d) return null;
       return { ...base, id: `${food.id}:name`, correct: food.id, options: shuffle([food.id, ...d], rng) };
+    }
+    case "ingfood": {
+      // "Which dish is made with these ingredients?" — options are food names
+      const d = foodNameDistractors(food, rng);
+      if (!d || food.ings.length < 3) return null;
+      return { ...base, id: `${food.id}:ingfood`, correct: food.id, options: shuffle([food.id, ...d], rng) };
+    }
+    case "recipe": {
+      // "Which dish do these recipe steps describe?"
+      const d = foodNameDistractors(food, rng);
+      if (!d) return null;
+      return { ...base, id: `${food.id}:recipe`, correct: food.id, options: shuffle([food.id, ...d], rng) };
+    }
+    case "city": {
+      const c = cityOf(food);
+      if (!c) return null;
+      const sameCountry = db.byCountry.get(food.country) ?? [];
+      const otherCities = [...new Set(sameCountry.map((x) => cityOf(x)).filter((x) => x && x !== c))] as string[];
+      const d = shuffle(otherCities, rng).slice(0, 3);
+      if (d.length < 3) return null;
+      return { ...base, id: `${food.id}:city:${c}`, correct: c, options: shuffle([c, ...d], rng) };
     }
     default: return null;
   }
@@ -206,7 +244,7 @@ function sampleFoods(pool: Food[], n: number, rng: () => number): Food[] {
 
 const RAMP: Difficulty[] = ["easy", "easy", "easy", "medium", "medium", "medium", "medium", "hard", "hard", "hard", "extreme", "extreme", "extreme", "hard", "hard", "medium", "extreme", "hard", "medium", "easy"];
 
-export function buildSession(opts: { diff: Difficulty | "mixed"; country?: string; count: number; rng?: () => number }): Question[] {
+export function buildSession(opts: { diff: Difficulty | "mixed"; country?: string; city?: string; onlyType?: QType; count: number; rng?: () => number }): Question[] {
   const db = DB();
   const rng = opts.rng ?? Math.random;
   const avoid = seenIds();
@@ -214,12 +252,24 @@ export function buildSession(opts: { diff: Difficulty | "mixed"; country?: strin
   const usedFoods = new Set<string>();
 
   // Impossible mode uses its own separate trivia pool — never mixed with other difficulties.
-  if (opts.diff === "impossible" && !opts.country) {
+  if (opts.diff === "impossible" && !opts.country && !opts.city && !opts.onlyType) {
     return shuffle(TRIVIA, rng).slice(0, Math.min(opts.count, TRIVIA.length)).map((tq) => triviaToQuestion(tq, rng));
   }
 
-  if (opts.country) {
-    const pool = db.byCountry.get(opts.country) ?? [];
+  // Mystery mode: name-only questions; the tile reveal does the difficulty work.
+  if (opts.onlyType) {
+    const pool = opts.country ? (db.byCountry.get(opts.country) ?? []) : db.foods;
+    for (const f of sampleFoods(pool, opts.count * 2, rng)) {
+      if (out.length >= opts.count) break;
+      if (usedFoods.has(f.id)) continue;
+      const q = makeQuestion(f, opts.onlyType, rng);
+      if (q && !avoid.has(q.id)) { out.push(q); usedFoods.add(f.id); }
+    }
+    return out;
+  }
+
+  if (opts.country || opts.city) {
+    const pool = opts.city ? db.foods.filter((f) => cityOf(f) === opts.city) : (db.byCountry.get(opts.country!) ?? []);
     for (const f of sampleFoods(pool, opts.count * 2, rng)) {
       if (out.length >= opts.count) break;
       if (usedFoods.has(f.id)) continue;
@@ -274,23 +324,55 @@ export function nextLiveQuestion(index: number, used: Set<string>, rng: () => nu
   return null;
 }
 
-/** Daily challenge: identical for all players on a given date. */
+/** Daily challenge: identical for all players on a given date. Rotates a world theme. */
+export interface DailyTheme { kind: "continent" | "country"; id: string; icon: string; label: L10n }
+export const DAILY_THEMES: DailyTheme[] = [
+  { kind: "continent", id: "asia", icon: "🌏", label: { en: "Taste of Asia", fa: "طعم آسیا", ar: "نكهة آسيا" } },
+  { kind: "country", id: "iran", icon: "🇮🇷", label: { en: "Iranian Food Challenge", fa: "چالش غذای ایرانی", ar: "تحدي الطعام الإيراني" } },
+  { kind: "continent", id: "europe", icon: "🏰", label: { en: "European Table", fa: "سفره اروپایی", ar: "المائدة الأوروبية" } },
+  { kind: "country", id: "japan", icon: "🇯🇵", label: { en: "Japanese Delicacies", fa: "ظرافت‌های ژاپنی", ar: "أطايب يابانية" } },
+  { kind: "continent", id: "americas", icon: "🌎", label: { en: "Americas Feast", fa: "ضیافت قاره آمریکا", ar: "وليمة الأمريكيتين" } },
+  { kind: "country", id: "mexico", icon: "🇲🇽", label: { en: "Mexican Fiesta", fa: "فیستای مکزیکی", ar: "احتفال مكسيكي" } },
+  { kind: "continent", id: "africa", icon: "🌍", label: { en: "African Pot", fa: "دیگ آفریقایی", ar: "قِدر أفريقيا" } },
+  { kind: "country", id: "turkey", icon: "🇹🇷", label: { en: "Turkish Kitchen", fa: "آشپزخانه ترکی", ar: "المطبخ التركي" } },
+  { kind: "country", id: "italy", icon: "🇮🇹", label: { en: "Italian Classics", fa: "کلاسیک‌های ایتالیایی", ar: "كلاسيكيات إيطالية" } },
+  { kind: "country", id: "india", icon: "🇮🇳", label: { en: "Indian Spice Route", fa: "مسیر ادویه هند", ar: "طريق التوابل الهندي" } },
+  { kind: "country", id: "lebanon", icon: "🇱🇧", label: { en: "Levantine Spread", fa: "سفره شامی", ar: "مائدة شامية" } },
+  { kind: "country", id: "thailand", icon: "🇹🇭", label: { en: "Thai Street Fire", fa: "آتیش خیابانی تایلند", ar: "نار الشارع التايلاندي" } },
+];
+
+export function dailyTheme(dateKey: string): DailyTheme {
+  return DAILY_THEMES[hashStr(`theme-${dateKey}`) % DAILY_THEMES.length];
+}
+
 export function dailySession(dateKey: string): Question[] {
   const rng = mulberry32(hashStr(`daily-${dateKey}`));
-  const avoid = new Set<string>(); // no anti-repeat: same for everyone
+  const theme = dailyTheme(dateKey);
   const db = DB();
+  const pool = theme.kind === "country"
+    ? (db.byCountry.get(theme.id) ?? [])
+    : db.foods.filter((f) => getCountry(f.country)?.continent === theme.id);
+
   const plan: Difficulty[] = ["easy", "easy", "medium", "medium", "medium", "hard", "hard", "extreme", "extreme", "impossible"];
   const out: Question[] = [];
   const used = new Set<string>();
+  const localPool = (diff: Difficulty) => shuffle(pool.filter((f) => f.diff === diff && !used.has(f.id)), rng);
   for (const diff of plan) {
     if (diff === "impossible") {
       out.push(triviaToQuestion(pick(TRIVIA, rng), rng));
       continue;
     }
-    const pool = shuffle((db.byDiff.get(diff) ?? []).filter((f) => !used.has(f.id)), rng);
-    for (const f of pool) {
-      const q = genForFood(f, rng, avoid);
-      if (q) { out.push(q); used.add(f.id); break; }
+    let placed = false;
+    for (const f of localPool(diff)) {
+      const q = genForFood(f, rng, new Set());
+      if (q) { out.push(q); used.add(f.id); placed = true; break; }
+    }
+    if (!placed) {
+      // theme pool too small at this difficulty — pull any unused theme food
+      for (const f of shuffle(pool.filter((x) => !used.has(x.id)), rng)) {
+        const q = genForFood(f, rng, new Set());
+        if (q) { out.push(q); used.add(f.id); break; }
+      }
     }
   }
   return out;
@@ -324,6 +406,19 @@ export const ACHIEVEMENTS: AchievementDef[] = [
   { id: "level-25", icon: "🌠", name: { en: "Master Taster", fa: "چشنده استاد", ar: "ذواقة ماهر" }, desc: { en: "Reach level 25", fa: "به سطح ۲۵ برس", ar: "اوصل للمستوى 25" }, test: (p) => levelFromXp(p.xp).level >= 25 },
   { id: "games-10", icon: "🎮", name: { en: "Player", fa: "بازیکن", ar: "لاعب" }, desc: { en: "Play 10 games", fa: "۱۰ بازی انجام بده", ar: "العب 10 ألعاب" }, test: (p) => p.games >= 10 },
   { id: "globe-trotter", icon: "🧭", name: { en: "Globe Trotter", fa: "جهان‌نورد", ar: "جوّاب العالم" }, desc: { en: "Correct answers from 40+ countries", fa: "پاسخ درست از ۴۰+ کشور", ar: "إجابات من 40+ دولة" }, test: (p) => Object.values(p.countryWins).filter((v) => v > 0).length >= 40 },
+  // ---- collection / discovery achievements ----
+  { id: "first-taste", icon: "🍴", name: { en: "First Taste", fa: "اولین چشیدن", ar: "أول تذوّق" }, desc: { en: "Discover your first food", fa: "اولین غذای خود را کشف کن", ar: "اكتشف أول طعام لك" }, test: (p) => p.discovered.length >= 1 },
+  { id: "collector-50", icon: "📔", name: { en: "Collector", fa: "جمع‌آوری‌کننده", ar: "جامع" }, desc: { en: "Discover 50 foods", fa: "۵۰ غذا کشف کن", ar: "اكتشف 50 طعاماً" }, test: (p) => p.discovered.length >= 50 },
+  { id: "collector-200", icon: "📚", name: { en: "Food Archivist", fa: "آرشیودار غذا", ar: "مؤرشف الطعام" }, desc: { en: "Discover 200 foods", fa: "۲۰۰ غذا کشف کن", ar: "اكتشف 200 طعام" }, test: (p) => p.discovered.length >= 200 },
+  { id: "iran-explorer", icon: "🗺️", name: { en: "Iran Explorer", fa: "کاوشگر ایران", ar: "مستكشف إيران" }, desc: { en: "Discover 50 Iranian foods", fa: "۵۰ غذای ایرانی کشف کن", ar: "اكتشف 50 طعاماً إيرانياً" }, test: (p) => p.discovered.filter((id) => getFood(id)?.country === "iran").length >= 50 },
+  { id: "world-traveler-2", icon: "🛫", name: { en: "World Traveler", fa: "جهانگرد", ar: "رحّالة العالم" }, desc: { en: "Discover foods from 25 countries", fa: "از ۲۵ کشور غذا کشف کن", ar: "اكتشف أطعمة من 25 دولة" }, test: (p) => new Set(p.discovered.map((id) => getFood(id)?.country).filter(Boolean)).size >= 25 },
+  { id: "global-master", icon: "👑", name: { en: "Global Food Master", fa: "استاد جهانی غذا", ar: "خبير الطعام العالمي" }, desc: { en: "Discover foods from 80+ countries", fa: "از ۸۰+ کشور غذا کشف کن", ar: "اكتشف أطعمة من 80+ دولة" }, test: (p) => new Set(p.discovered.map((id) => getFood(id)?.country).filter(Boolean)).size >= 80 },
+  { id: "city-explorer", icon: "🏙️", name: { en: "City Explorer", fa: "کاوشگر شهرها", ar: "مستكشف المدن" }, desc: { en: "Discover foods from 30 cities", fa: "از ۳۰ شهر غذا کشف کن", ar: "اكتشف أطعمة من 30 مدينة" }, test: (p) => new Set(p.discovered.map((id) => { const f = getFood(id); return f ? cityOf(f) : null; }).filter(Boolean)).size >= 30 },
+  { id: "dessert-master", icon: "🍰", name: { en: "Dessert Master", fa: "استاد دسر", ar: "خبير الحلويات" }, desc: { en: "Discover 20 desserts", fa: "۲۰ دسر کشف کن", ar: "اكتشف 20 حلوى" }, test: (p) => p.discovered.filter((id) => getFood(id)?.cats.includes("dessert")).length >= 20 },
+  { id: "regional-expert", icon: "🥘", name: { en: "Regional Expert", fa: "کارشناس منطقه‌ای", ar: "خبير إقليمي" }, desc: { en: "Discover 60 regional dishes", fa: "۶۰ غذای منطقه‌ای کشف کن", ar: "اكتشف 60 طبقاً إقليمياً" }, test: (p) => p.discovered.filter((id) => { const f = getFood(id); return f && f.region && f.region !== "Nationwide"; }).length >= 60 },
+  { id: "spice-hunter", icon: "🌶️", name: { en: "Spice Hunter", fa: "شکارچی ادویه", ar: "صائد التوابل" }, desc: { en: "Discover 20 spicy foods", fa: "۲۰ غذای تند کشف کن", ar: "اكتشف 20 طعاماً حاراً" }, test: (p) => p.discovered.filter((id) => (getFood(id)?.spice ?? 0) >= 2).length >= 20 },
+  { id: "food-legend", icon: "🌟", name: { en: "Food Legend", fa: "افسانه غذا", ar: "أسطورة الطعام" }, desc: { en: "Reach level 30", fa: "به سطح ۳۰ برس", ar: "اوصل للمستوى 30" }, test: (p) => levelFromXp(p.xp).level >= 30 },
+  { id: "mystery-master", icon: "🕵️", name: { en: "Mystery Master", fa: "استاد معما", ar: "خبير الألغاز" }, desc: { en: "Score 2000+ in Mystery Food", fa: "۲۰۰۰+ امتیاز در غذای مرموز", ar: "2000+ نقطة في الطعام الغامض" }, test: (p) => p.mysteryBest >= 2000 },
 ];
 
 export function evaluateAchievements(p: Profile): string[] {
@@ -331,11 +426,33 @@ export function evaluateAchievements(p: Profile): string[] {
 }
 
 /** Applies a finished game to the profile; returns fresh profile + events for UI. */
-export function applyResult(p: Profile, r: GameResult): { profile: Profile; newUnlocked: string[]; levelBefore: number } {
+export interface AppliedResult { profile: Profile; newUnlocked: string[]; levelBefore: number; coinsEarned: number; newlyDiscovered: string[] }
+
+export function applyResult(p: Profile, r: GameResult, hintsUsedThisGame = 0): AppliedResult {
   const levelBefore = levelFromXp(p.xp).level;
+
+  // ---- discovery: a correct answer on a food "discovers" it for the collection ----
+  const newlyDiscovered: string[] = [];
+  const discovered = new Set(p.discovered);
+  for (const a of r.answers) {
+    if (a.correct && a.foodId && !discovered.has(a.foodId)) {
+      discovered.add(a.foodId);
+      newlyDiscovered.push(a.foodId);
+    }
+  }
+
+  // ---- coins: reward correct answers, streaks, discoveries, dailies, achievements ----
+  let coinsEarned = r.correct * 5;
+  coinsEarned += newlyDiscovered.length * 10;
+  if (r.bestStreak >= 5) coinsEarned += 10;
+  if (r.bestStreak >= 10) coinsEarned += 15;
+  if (r.mode === "daily" && r.completed) coinsEarned += 40;
+  if (r.completed && r.wrong === 0 && r.correct > 0) coinsEarned += 25;
+
   const np: Profile = {
     ...p,
     xp: p.xp + r.xp,
+    coins: p.coins + coinsEarned,
     games: p.games + 1,
     correct: p.correct + r.correct,
     wrong: p.wrong + r.wrong,
@@ -346,6 +463,9 @@ export function applyResult(p: Profile, r: GameResult): { profile: Profile; newU
     impossibleCorrect: p.impossibleCorrect + r.impossibleCorrect,
     perfectRounds: p.perfectRounds + (r.completed && r.wrong === 0 && r.correct > 0 ? 1 : 0),
     timeAttackBest: r.mode === "timeattack" ? Math.max(p.timeAttackBest, r.score) : p.timeAttackBest,
+    mysteryBest: r.mode === "mystery" ? Math.max(p.mysteryBest, r.score) : p.mysteryBest,
+    discovered: [...discovered],
+    hintsUsed: p.hintsUsed + hintsUsedThisGame,
     countryWins: { ...p.countryWins },
     foodWins: { ...p.foodWins },
     totalsByContinent: { ...p.totalsByContinent },
@@ -362,5 +482,18 @@ export function applyResult(p: Profile, r: GameResult): { profile: Profile; newU
   }
   const newUnlocked = evaluateAchievements(np);
   np.unlocked = [...np.unlocked, ...newUnlocked];
-  return { profile: np, newUnlocked, levelBefore };
+  np.coins += newUnlocked.length * 25; // achievement bonus
+  coinsEarned += newUnlocked.length * 25;
+  return { profile: np, newUnlocked, levelBefore, coinsEarned, newlyDiscovered };
 }
+
+// ---------------- hints (paid with coins or free daily allowance) ----------------
+export interface HintDef { id: string; icon: string; cost: number; label: string }
+export const HINTS: HintDef[] = [
+  { id: "reveal-country", icon: "🌍", cost: 15, label: "hintCountry" },
+  { id: "first-letter", icon: "🔤", cost: 10, label: "hintLetter" },
+  { id: "remove-wrong", icon: "✂️", cost: 20, label: "hintRemove" },
+  { id: "reveal-category", icon: "🗂️", cost: 10, label: "hintCategory" },
+  { id: "reveal-region", icon: "📍", cost: 15, label: "hintRegion" },
+  { id: "reveal-image", icon: "🖼️", cost: 12, label: "hintImage" },
+];

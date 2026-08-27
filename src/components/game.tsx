@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AnswerLog, Difficulty, Food, GameConfig, GameResult, Question } from "../data/types";
 import { useI18n } from "../lib/i18n";
-import { getFood, countryName, cuisineOf, ingredientName, meatName, categoryName, getCountry } from "../lib/data";
-import { comboFor, pointsFor, nextLiveQuestion, markSeen, getScoring, levelFromXp } from "../lib/engine";
+import { getFood, countryName, cuisineOf, ingredientName, meatName, categoryName, getCountry, cityNameOf, cityOf } from "../lib/data";
+import { cityName } from "../data/cities";
+import { comboFor, pointsFor, nextLiveQuestion, markSeen, getScoring, levelFromXp, HINTS } from "../lib/engine";
+import { getRecipe, recipeStepText } from "../lib/recipes";
 import { sfx } from "../lib/sound";
 import { Bar, Btn, Chip, ComboBadge, CountUp, FoodTile, Hearts, Icon, Reveal } from "./ui";
 
 const PROMPT_KEYS: Record<string, string> = {
   country: "qCountry", cuisine: "qCuisine", ingredient: "qIngredient",
   meat: "qMeat", region: "qRegion", notingredient: "qNotIngredient", foodname: "qFoodName",
+  ingfood: "qIngFood", recipe: "qRecipe", city: "qCity",
 };
 
 function optionLabel(q: Question, key: string, lang: "en" | "fa" | "ar"): string {
@@ -22,7 +25,8 @@ function optionLabel(q: Question, key: string, lang: "en" | "fa" | "ar"): string
     case "cuisine": return cuisineOf(key, lang);
     case "ingredient": case "notingredient": return ingredientName(key, lang);
     case "meat": return meatName(key, lang);
-    case "foodname": { const f = getFood(key); return f ? (lang === "fa" ? f.fa : lang === "ar" ? f.ar : f.en) : key; }
+    case "city": return cityName(key, lang);
+    case "foodname": case "ingfood": case "recipe": { const f = getFood(key); return f ? (lang === "fa" ? f.fa : lang === "ar" ? f.ar : f.en) : key; }
     default: return key;
   }
 }
@@ -66,11 +70,13 @@ export function FoodInfoCard({ food, compact = false }: { food: Food | undefined
 }
 
 /* ================= GAME SCREEN ================= */
-export function GameScreen({ cfg, initial, onDone, onQuit }: {
+export function GameScreen({ cfg, initial, onDone, onQuit, coins, onSpendCoins, onUseFreeHint, freeHints }: {
   cfg: GameConfig; initial?: Question[]; onDone: (r: GameResult) => void; onQuit: () => void;
+  coins: number; onSpendCoins: (n: number) => boolean; onUseFreeHint: () => boolean; freeHints: number;
 }) {
   const { lang, t, L } = useI18n();
   const live = cfg.mode === "endless" || cfg.mode === "timeattack";
+  const isMystery = cfg.mode === "mystery";
   const [qs, setQs] = useState<Question[]>(initial ?? []);
   const [idx, setIdx] = useState(0);
   const [phase, setPhase] = useState<"play" | "feedback" | "over">("play");
@@ -86,6 +92,14 @@ export function GameScreen({ cfg, initial, onDone, onQuit }: {
   const [lostLife, setLostLife] = useState(false);
   const [timeLeft, setTimeLeft] = useState(cfg.seconds ?? 60);
   const [secondsOnQ, setSecondsOnQ] = useState(0);
+  // mystery reveals + hints (per question)
+  const [reveals, setReveals] = useState(0);
+  const [hintCountry, setHintCountry] = useState(false);
+  const [hintCategory, setHintCategory] = useState(false);
+  const [hintRegion, setHintRegion] = useState(false);
+  const [removedOption, setRemovedOption] = useState<number | null>(null);
+  const [hintToast, setHintToast] = useState<string | null>(null);
+  const hintsThisGame = useRef(0);
 
   const usedRef = useRef<Set<string>>(new Set());
   const qStartRef = useRef(Date.now());
@@ -127,9 +141,10 @@ export function GameScreen({ cfg, initial, onDone, onQuit }: {
     if (ans.length >= 10 && correct.length === ans.length) xp += 100; // perfect bonus
     if (correct.length > 0) xp += 25; // completion bonus
     const r: GameResult = {
-      mode: cfg.mode, diff: cfg.diff, country: cfg.country,
+      mode: cfg.mode, diff: cfg.diff, country: cfg.country, city: cfg.city,
       score: scoreRef.current, total: ans.length, correct: correct.length, wrong: ans.length - correct.length,
       accuracy: ans.length ? Math.round((correct.length / ans.length) * 100) : 0,
+      hintsUsed: hintsThisGame.current,
       bestCombo: comboRef.current >= 1 ? Math.max(comboRef.current, bestComboFromStreak(bestStreakRef.current)) : bestComboFromStreak(bestStreakRef.current),
       bestStreak: bestStreakRef.current,
       xp, answers: ans, completed: true,
@@ -169,7 +184,9 @@ export function GameScreen({ cfg, initial, onDone, onQuit }: {
       setStreak(ns); setBestStreak(bestStreakRef.current); setComboNow(combo);
       let bonus = 0;
       if (cfg.mode === "timeattack") bonus = Math.max(0, 5 - Math.min(5, secondsOnQ)) * 20;
-      const pts = pointsFor(cur.diff, ns, bonus);
+      let pts = pointsFor(cur.diff, ns, bonus);
+      // mystery: fewer image reveals = bigger reward
+      if (isMystery) pts = Math.round(pts * [1.5, 1.2, 1.0, 0.8][Math.min(3, reveals)]);
       scoreRef.current += pts;
       setScore(scoreRef.current);
       setFloatPts({ v: pts, k: Date.now() });
@@ -199,6 +216,7 @@ export function GameScreen({ cfg, initial, onDone, onQuit }: {
   const next = useCallback(() => {
     if (phaseRef.current !== "feedback") return;
     setSelected(null); setLostLife(false); setSecondsOnQ(0);
+    setReveals(0); setHintCountry(false); setHintCategory(false); setHintRegion(false); setRemovedOption(null);
     if (livesRef.current <= 0) { finish(); return; }
     if (live) {
       const nq = nextLiveQuestion(usedRef.current.size, usedRef.current);
@@ -226,6 +244,41 @@ export function GameScreen({ cfg, initial, onDone, onQuit }: {
     return () => window.removeEventListener("keydown", onKey);
   }, [phase, pick, next]);
 
+  // ---- hints / reveals: prefer the daily free allowance, then coins ----
+  const payForHint = useCallback((): boolean => {
+    if (onUseFreeHint()) { hintsThisGame.current += 1; return true; }
+    return false;
+  }, [onUseFreeHint]);
+  const payCoins = useCallback((n: number): boolean => {
+    if (onSpendCoins(n)) { hintsThisGame.current += 1; return true; }
+    setHintToast(t("notEnoughCoins"));
+    setTimeout(() => setHintToast(null), 1600);
+    return false;
+  }, [onSpendCoins, t]);
+
+  const useHint = useCallback((id: string) => {
+    if (phaseRef.current !== "play") return;
+    const def = HINTS.find((h) => h.id === id);
+    if (!def) return;
+    const ok = payForHint() || payCoins(def.cost);
+    if (!ok) return;
+    sfx.play("click");
+    const cur = qs[idx];
+    switch (id) {
+      case "reveal-country": setHintCountry(true); break;
+      case "reveal-category": setHintCategory(true); break;
+      case "reveal-region": setHintRegion(true); break;
+      case "remove-wrong": {
+        if (cur) {
+          const wrongs = cur.options.map((o, i) => (o !== cur.correct ? i : -1)).filter((i) => i >= 0 && i !== removedOption);
+          if (wrongs.length) setRemovedOption(wrongs[Math.floor(Math.random() * wrongs.length)]);
+        }
+        break;
+      }
+      default: break;
+    }
+  }, [qs, idx, removedOption, payForHint, payCoins]);
+
   const diffLabel = t(cfg.diff === "mixed" ? "mixed" : cfg.diff);
   const modeLabel = t(cfg.mode === "country" ? "countryMode" : cfg.mode === "timeattack" ? "timeattack" : cfg.mode === "endless" ? "endless" : cfg.mode === "world" ? "worldMode" : cfg.mode === "classic" ? "classic" : "dailyChallenge");
   const lastWrong = phase === "feedback" && selected !== null && q ? q.options[selected] !== q.correct : false;
@@ -235,8 +288,17 @@ export function GameScreen({ cfg, initial, onDone, onQuit }: {
     if (!q) return "";
     if (q.custom) return L(q.custom.prompt);
     const fname = food ? (lang === "fa" ? food.fa : lang === "ar" ? food.ar : food.en) : "";
+    // ingredient & recipe challenges must NOT reveal the dish name in the prompt
+    if (q.type === "ingfood" || q.type === "recipe") return t(PROMPT_KEYS[q.type]);
     return t(PROMPT_KEYS[q.type], { food: `«${fname}»` });
   }, [q, food, lang, t, L]);
+
+  // recipe steps preview for recipe challenges
+  const recipePreview = useMemo(() => {
+    if (!q || q.type !== "recipe" || !food) return null;
+    const r = getRecipe(food, lang);
+    return r.steps.slice(0, 2).map((s, i) => ({ n: i + 1, text: recipeStepText(s, lang) }));
+  }, [q, food, lang]);
 
   if (phase === "over") {
     return (
@@ -302,7 +364,50 @@ export function GameScreen({ cfg, initial, onDone, onQuit }: {
       {q && (
         <div key={q.id} className="anim-rise">
           {/* visual clue */}
-          {q.type === "foodname" && !q.custom ? (
+          {isMystery && food ? (
+            <div className="flex flex-col items-center mb-5">
+              <div className="relative">
+                <div
+                  className="transition-all duration-500"
+                  style={{ filter: reveals === 0 ? "blur(26px) saturate(0.2)" : reveals === 1 ? "blur(14px) saturate(0.6)" : reveals === 2 ? "blur(6px)" : "none" }}
+                >
+                  <FoodTile food={food} size="hero" className="max-w-md w-full" />
+                </div>
+                {reveals === 0 && (
+                  <span className="absolute inset-0 flex items-center justify-center text-6xl" aria-hidden="true">❓</span>
+                )}
+              </div>
+              <div className="flex items-center gap-3 mt-3">
+                {reveals < 3 && phase === "play" && (
+                  <Btn size="sm" variant="teal" onClick={() => { if (payForHint() || payCoins(12)) { setReveals((r) => r + 1); sfx.play("flip"); } }}>
+                    <Icon name="search" className="w-4 h-4" /> {t("revealImage")} · {t("coinsLbl")} 12
+                  </Btn>
+                )}
+                <Chip tone={reveals === 0 ? "herb" : "chili"}>{t("revealCost", { n: reveals })}</Chip>
+              </div>
+            </div>
+          ) : q.type === "ingfood" && food ? (
+            <div className="bg-panel border border-line rounded-3xl p-5 mb-5">
+              <div className="text-dim text-xs font-bold uppercase tracking-widest mb-3 text-center">{t("ingredientsLbl")}</div>
+              <div className="flex flex-wrap justify-center gap-2">
+                {food.ings.slice(0, 6).map((i) => (
+                  <Chip key={i} tone="saffron" className="text-sm px-3 py-1.5">{ingredientName(i, lang)}</Chip>
+                ))}
+              </div>
+            </div>
+          ) : q.type === "recipe" && recipePreview ? (
+            <div className="bg-panel border border-line rounded-3xl p-5 mb-5 max-w-xl mx-auto">
+              <div className="text-dim text-xs font-bold uppercase tracking-widest mb-3 text-center">{t("recipeLbl")} · {t("generatedRecipe")}</div>
+              <ol className="space-y-2.5">
+                {recipePreview.map((s) => (
+                  <li key={s.n} className="flex gap-3 text-sm text-mut leading-relaxed">
+                    <span className="shrink-0 w-6 h-6 rounded-full bg-saffron/15 text-saffron font-display font-bold flex items-center justify-center text-xs">{s.n}</span>
+                    <span>{s.text}</span>
+                  </li>
+                ))}
+              </ol>
+            </div>
+          ) : q.type === "foodname" && !q.custom ? (
             <div className="bg-panel border border-line rounded-3xl p-5 mb-5 flex flex-col sm:flex-row items-center gap-5">
               <FoodTile food={food} size="lg" className="anim-pop" />
               <div>
@@ -324,19 +429,30 @@ export function GameScreen({ cfg, initial, onDone, onQuit }: {
 
           <h2 className="font-display font-bold text-xl sm:text-2xl text-center leading-snug mb-5 min-h-[3.5rem]">{prompt}</h2>
 
+          {/* revealed hints */}
+          {(hintCountry || hintCategory || hintRegion) && food && (
+            <div className="flex flex-wrap justify-center gap-2 mb-4">
+              {hintCountry && <Chip tone="teal">🌍 {countryName(food.country, lang)}</Chip>}
+              {hintCategory && food.cats[0] && <Chip tone="herb">🗂️ {categoryName(food.cats[0], lang)}</Chip>}
+              {hintRegion && <Chip tone="saffron">📍 {cityNameOf(food, lang)}</Chip>}
+            </div>
+          )}
+
           {/* options */}
           <div className="grid sm:grid-cols-2 gap-3">
             {q.options.map((opt, i) => {
               const isSel = selected === i;
               const isCorrect = i === correctKeyIdx;
+              const isRemoved = removedOption === i && phase === "play";
               let cls = "bg-panel border-line hover:border-saffron/70 hover:bg-panel2 card-hover";
+              if (isRemoved) cls = "bg-panel border-line opacity-25 line-through";
               if (phase === "feedback") {
                 if (isCorrect) cls = "bg-herb/15 border-herb text-ink";
                 else if (isSel) cls = "bg-chili/15 border-chili anim-shake";
                 else cls = "bg-panel border-line opacity-45";
               }
               return (
-                <button key={opt + i} onClick={() => pick(i)} disabled={phase !== "play"}
+                <button key={opt + i} onClick={() => pick(i)} disabled={phase !== "play" || isRemoved}
                   className={`relative flex items-center gap-3 text-start px-4 py-4 rounded-2xl border-2 font-medium text-[15px] sm:text-base transition-colors ${cls}`}
                   aria-label={`Answer ${i + 1}`}>
                   <span className="w-8 h-8 shrink-0 rounded-lg bg-black/25 border border-line2 flex items-center justify-center font-display font-bold text-sm text-saffron">
@@ -353,6 +469,32 @@ export function GameScreen({ cfg, initial, onDone, onQuit }: {
               );
             })}
           </div>
+
+          {/* hint toolbar */}
+          {phase === "play" && !q.custom && (
+            <div className="mt-4">
+              <div className="flex items-center justify-center gap-2 flex-wrap">
+                <span className="text-xs text-dim font-bold flex items-center gap-1">
+                  💰 {coins.toLocaleString()} · {freeHints > 0 ? t("freeHintsLeft", { n: freeHints }) : t("useHint")}
+                </span>
+              </div>
+              <div className="flex items-center justify-center gap-2 flex-wrap mt-2">
+                {HINTS.filter((h) => h.id !== "reveal-image").map((h) => {
+                  const used =
+                    (h.id === "reveal-country" && hintCountry) ||
+                    (h.id === "reveal-category" && hintCategory) ||
+                    (h.id === "reveal-region" && hintRegion);
+                  return (
+                    <button key={h.id} onClick={() => useHint(h.id)} disabled={used || (q.type !== "foodname" && q.type !== "ingfood" && q.type !== "recipe" && h.id !== "remove-wrong")}
+                      className="btn-press flex items-center gap-1.5 text-xs font-semibold border border-line bg-panel rounded-full px-3 py-1.5 hover:border-teal/60 disabled:opacity-30"
+                      title={t(h.label)}>
+                      <span aria-hidden="true">{h.icon}</span> {t(h.label)} <span className="text-teal">{h.cost}💰</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           {/* feedback */}
           {phase === "feedback" && q && (
@@ -440,6 +582,8 @@ export function ResultScreen({ result, onPlayAgain, onHome, unlocked, levelNow }
             { l: t("bestComboLbl"), v: `×${result.bestCombo}`, i: "flame" },
             { l: t("highestStreakLbl"), v: String(result.bestStreak), i: "bolt" },
             { l: t("xpEarned"), v: `+${result.xp}`, i: "star" },
+            { l: t("coinsEarned"), v: `+${result.coinsEarned ?? 0} 💰`, i: "medal" },
+            { l: t("foodsDiscovered"), v: `+${result.discoveries ?? 0}`, i: "book" },
             { l: t("level"), v: String(levelNow), i: "medal" },
           ].map((s, i) => (
             <div key={i} className="bg-panel border border-line rounded-2xl p-4 text-center card-hover">

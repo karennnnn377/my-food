@@ -2,8 +2,8 @@
 
 export type Lang = "en" | "fa" | "ar";
 export type Difficulty = "easy" | "medium" | "hard" | "extreme" | "impossible";
-export type QType = "country" | "foodname" | "ingredient" | "meat" | "region" | "cuisine" | "notingredient";
-export type GameMode = "classic" | "timeattack" | "endless" | "country" | "world" | "daily";
+export type QType = "country" | "foodname" | "ingredient" | "meat" | "region" | "cuisine" | "notingredient" | "ingfood" | "city" | "recipe";
+export type GameMode = "classic" | "timeattack" | "endless" | "country" | "world" | "daily" | "mystery" | "city";
 export type Spice = 0 | 1 | 2 | 3;
 export type MeatKey = "beef" | "lamb" | "chicken" | "fish" | "shrimp" | "pork" | "turkey" | "duck" | "offal" | "other" | "none";
 
@@ -54,6 +54,7 @@ export interface GameConfig {
   mode: GameMode;
   diff: Difficulty | "mixed";
   country?: string;
+  city?: string;
   questions: number;
   lives: number;
   seconds?: number; // time attack
@@ -65,6 +66,7 @@ export interface GameResult {
   mode: GameMode;
   diff: Difficulty | "mixed";
   country?: string;
+  city?: string;
   score: number;
   total: number;
   correct: number;
@@ -76,11 +78,16 @@ export interface GameResult {
   answers: AnswerLog[];
   completed: boolean;
   impossibleCorrect: number;
+  hintsUsed?: number;
+  discoveries?: number;
+  coinsEarned?: number;
 }
 
 export interface Profile {
   name: string;
+  avatar: string;
   xp: number;
+  coins: number;
   games: number;
   correct: number;
   wrong: number;
@@ -97,6 +104,11 @@ export interface Profile {
   dailyDone: Record<string, { score: number; correct: number; total: number }>;
   totalsByContinent: Record<string, number>;
   timeAttackBest: number;
+  discovered: string[]; // discovered food ids (collection)
+  freeHintsDate: string;
+  freeHintsLeft: number;
+  hintsUsed: number;
+  mysteryBest: number;
 }
 
 export interface Settings {

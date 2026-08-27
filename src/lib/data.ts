@@ -2,6 +2,7 @@ import { COUNTRIES } from "../data/countries";
 import { IRAN_FOODS } from "../data/foods-iran";
 import { WORLD_FOODS } from "../data/foods-world";
 import { INGREDIENTS, MEATS, CATEGORIES } from "../data/ingredients";
+import { CITIES, resolveCity } from "../data/cities";
 import type { Country, Food, Lang, Difficulty } from "../data/types";
 
 /** Scalable data layer. The UI never touches raw seed files — everything goes
@@ -94,6 +95,49 @@ export const cuisineOf = (countryId: string, lang: Lang) => {
   if (!c) return "—";
   return lang === "fa" ? (c.cuisine.fa ?? c.cuisine.en) : lang === "ar" ? (c.cuisine.ar ?? c.cuisine.en) : c.cuisine.en;
 };
+
+// ---------- city axis ----------
+const cityCache = new Map<string, string | null>();
+export function cityOf(f: Food): string | null {
+  let c = cityCache.get(f.id);
+  if (c === undefined) {
+    c = resolveCity(f.region, f.country);
+    cityCache.set(f.id, c);
+  }
+  return c;
+}
+export const foodsOfCity = (cityId: string) => db.foods.filter((f) => cityOf(f) === cityId);
+export function citiesOfCountry(countryId: string): { id: string; count: number }[] {
+  const counts = new Map<string, number>();
+  for (const f of db.byCountry.get(countryId) ?? []) {
+    const c = cityOf(f);
+    if (c) counts.set(c, (counts.get(c) ?? 0) + 1);
+  }
+  return [...counts.entries()].map(([id, count]) => ({ id, count })).sort((a, b) => b.count - a.count);
+}
+export const getCity = (id: string) => CITIES[id] ?? null;
+export function cityNameOf(f: Food, lang: Lang): string {
+  const id = cityOf(f);
+  if (!id) return f.region;
+  const c = CITIES[id];
+  return lang === "fa" ? c.fa : lang === "ar" ? c.ar : c.en;
+}
+
+/** Related foods: same country or ≥2 shared ingredients, capped. */
+export function relatedFoods(f: Food, n = 6): Food[] {
+  const scored = db.foods
+    .filter((x) => x.id !== f.id)
+    .map((x) => {
+      let s = 0;
+      if (x.country === f.country) s += 3;
+      s += x.ings.filter((i) => f.ings.includes(i)).length;
+      if (x.cats.some((c) => f.cats.includes(c))) s += 1;
+      return { x, s };
+    })
+    .filter((e) => e.s >= 3)
+    .sort((a, b) => b.s - a.s);
+  return scored.slice(0, n).map((e) => e.x);
+}
 
 export function foodMatchesQuery(f: Food, q: string): boolean {
   const s = q.trim().toLowerCase();
